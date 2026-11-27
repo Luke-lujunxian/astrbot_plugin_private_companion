@@ -11,8 +11,10 @@ disabled" and continue offering cookie/manual login.
 
 from __future__ import annotations
 
+import base64
 import ctypes
 import csv
+import hashlib
 import json
 import os
 import re
@@ -26,6 +28,7 @@ from typing import Any, Dict
 
 
 MAGIC = b"HWCRED1\0"
+LINUX_MAGIC = b"HWCRED2\0"
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
 
 
@@ -200,6 +203,45 @@ def _unprotect(data: bytes) -> bytes:
         del keepalive
 
 
+def _read_machine_identity() -> str:
+    for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            with open(path, "r", encoding="utf-8") as stream:
+                value = stream.read().strip()
+                if value:
+                    return value
+        except OSError:
+            continue
+    return ""
+
+
+def _get_fernet():
+    try:
+        from cryptography.fernet import Fernet
+    except ImportError as exc:
+        raise DPAPIUnavailableError("cryptography is unavailable on this host") from exc
+    machine_id = _read_machine_identity()
+    if not machine_id:
+        raise DPAPIUnavailableError("Host machine identifier is unavailable")
+    uid = os.getuid() if hasattr(os, "getuid") else os.environ.get("USER", "0")
+    material = f"astrbot-huawei-health-cred-v2:{machine_id}:{uid}".encode("utf-8")
+    key = base64.urlsafe_b64encode(hashlib.sha256(material).digest())
+    return Fernet(key)
+
+
+def _fernet_protect(data: bytes) -> bytes:
+    fernet = _get_fernet()
+    return fernet.encrypt(data)
+
+
+def _fernet_unprotect(data: bytes) -> bytes:
+    fernet = _get_fernet()
+    try:
+        return fernet.decrypt(data)
+    except Exception as exc:
+        raise CredentialsError("Linux Fernet decryption failed") from exc
+
+
 def mask_account(account: str) -> str:
     """Return a display mask that never reveals the whole secret.
 
@@ -240,7 +282,10 @@ class HuaweiCredentialsStore:
     @property
     def available(self) -> bool:
         try:
-            _require_dpapi()
+            if sys.platform == "win32":
+                _require_dpapi()
+            else:
+                _get_fernet()
             return True
         except DPAPIUnavailableError:
             return False
@@ -259,7 +304,10 @@ class HuaweiCredentialsStore:
                 {"account": account, "password": password, "updated_at": int(time.time())},
                 ensure_ascii=False, separators=(",", ":"),
             ).encode("utf-8")
-            ciphertext = MAGIC + _protect(payload)
+            if sys.platform == "win32":
+                ciphertext = MAGIC + _protect(payload)
+            else:
+                ciphertext = LINUX_MAGIC + _fernet_protect(payload)
             os.makedirs(self.data_dir, exist_ok=True)
             fd, tmp = tempfile.mkstemp(prefix=".credentials.", suffix=".tmp", dir=self.data_dir)
             try:
@@ -287,10 +335,16 @@ class HuaweiCredentialsStore:
                 # Locked / permission denied is NOT "never saved" — callers must
                 # be able to tell the user to close whatever holds the file.
                 raise CredentialsLockedError("cannot read credentials") from exc
-        if not raw.startswith(MAGIC) or len(raw) <= len(MAGIC):
+        if raw.startswith(MAGIC) and len(raw) > len(MAGIC):
+            unprotect_fn = _unprotect
+            encrypted = raw[len(MAGIC):]
+        elif raw.startswith(LINUX_MAGIC) and len(raw) > len(LINUX_MAGIC):
+            unprotect_fn = _fernet_unprotect
+            encrypted = raw[len(LINUX_MAGIC):]
+        else:
             raise CredentialsCorruptError("credentials file is invalid")
         try:
-            value = json.loads(_unprotect(raw[len(MAGIC):]).decode("utf-8"))
+            value = json.loads(unprotect_fn(encrypted).decode("utf-8"))
         except DPAPIUnavailableError:
             raise
         except Exception as exc:
